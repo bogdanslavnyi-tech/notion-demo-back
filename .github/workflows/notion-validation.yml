@@ -1,3 +1,4 @@
+
 name: Notion Validation
 
 on:
@@ -13,14 +14,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Validate ticket
+      - name: Validate and sync Notion ticket
         uses: actions/github-script@v7
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATA_SOURCE_ID: ${{ vars.NOTION_DATA_SOURCE_ID }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+
         with:
           script: |
+            // ------------------------------------
+            // 1. Configuration
+            // ------------------------------------
+
             const branch = process.env.PR_BRANCH;
             const token = process.env.NOTION_TOKEN;
             const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
@@ -29,6 +35,17 @@ jobs:
               core.setFailed("Notion credentials are not configured");
               return;
             }
+
+            const pr = context.payload.pull_request;
+
+            if (!pr) {
+              core.setFailed("Pull Request payload is missing");
+              return;
+            }
+
+            // ------------------------------------
+            // 2. Extract ticket ID from branch
+            // ------------------------------------
 
             const match = branch.match(
               /^(feat|fix|refactor|hotfix)\/(DEMO-\d+)-[a-z0-9-]+$/i
@@ -43,6 +60,10 @@ jobs:
             const [prefix, number] = ticketId.split("-");
 
             core.info(`Looking for Notion ticket: ${ticketId}`);
+
+            // ------------------------------------
+            // 3. Find ticket in Notion
+            // ------------------------------------
 
             const response = await fetch(
               `https://api.notion.com/v1/data_sources/${dataSourceId}/query`,
@@ -82,12 +103,18 @@ jobs:
               );
             });
 
-            if (tickets.length !== 1) {
-              core.setFailed(`Ticket ${ticketId} not found or duplicated`);
+            if (tickets.length !== 1 || data.has_more) {
+              core.setFailed(
+                `Ticket ${ticketId} not found or duplicated`
+              );
               return;
             }
 
             const ticket = tickets[0];
+
+            // ------------------------------------
+            // 4. Validate repository
+            // ------------------------------------
 
             const repository =
               ticket.properties?.Repository?.select?.name;
@@ -101,4 +128,98 @@ jobs:
 
             core.info(`Ticket ${ticketId} found successfully`);
             core.info(`Repository: ${repository}`);
-            core.info("Notion validation passed!");
+
+            // ------------------------------------
+            // 5. Validate Notion properties
+            // ------------------------------------
+
+            const properties = ticket.properties;
+
+            if (
+              properties.Branch?.type !== "rich_text" ||
+              properties["PR URL"]?.type !== "url" ||
+              properties.Status?.type !== "status"
+            ) {
+              core.setFailed(
+                "Notion properties Branch, PR URL or Status have incorrect types"
+              );
+              return;
+            }
+
+            const currentStatus = properties.Status.status?.name;
+
+            const allowedStatuses = [
+              "Backlog",
+              "In Progress",
+              "In Review",
+            ];
+
+            // ------------------------------------
+            // 6. Prepare Notion update
+            // ------------------------------------
+
+            const updatedProperties = {
+              Branch: {
+                rich_text: [
+                  {
+                    text: {
+                      content: branch,
+                    },
+                  },
+                ],
+              },
+
+              "PR URL": {
+                url: pr.html_url,
+              },
+            };
+
+            // Do not revert QA or completed tasks to In Review
+            if (allowedStatuses.includes(currentStatus)) {
+              updatedProperties.Status = {
+                status: {
+                  name: "In Review",
+                },
+              };
+            }
+
+            // ------------------------------------
+            // 7. Synchronize GitHub → Notion
+            // ------------------------------------
+
+            const updateResponse = await fetch(
+              `https://api.notion.com/v1/pages/${ticket.id}`,
+              {
+                method: "PATCH",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  "Notion-Version": "2026-03-11",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  properties: updatedProperties,
+                }),
+              }
+            );
+
+            if (!updateResponse.ok) {
+              const error = await updateResponse.text();
+
+              core.error(
+                `Notion update failed: HTTP ${updateResponse.status}`
+              );
+              core.debug(error);
+              core.setFailed("GitHub → Notion synchronization failed");
+              return;
+            }
+
+            // ------------------------------------
+            // 8. Success
+            // ------------------------------------
+
+            core.info(`Ticket ${ticketId} validated successfully`);
+            core.info(`Notion ticket updated successfully`);
+            core.info(`PR URL: ${pr.html_url}`);
+            core.info(`Branch: ${branch}`);
+            core.info(`Status: ${currentStatus}`);
+            core.info("GitHub → Notion synchronization completed");
