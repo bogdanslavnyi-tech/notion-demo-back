@@ -1,0 +1,178 @@
+
+name: Sync PR Merge to Notion
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  sync-merge:
+    name: Update Notion Task Status
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync merged PR to Notion
+        uses: actions/github-script@v7
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATA_SOURCE_ID: ${{ vars.NOTION_DATA_SOURCE_ID }}
+
+        with:
+          script: |
+            // ------------------------------------
+            // 1. Configuration
+            // ------------------------------------
+
+            const token = process.env.NOTION_TOKEN;
+            const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
+            const pr = context.payload.pull_request;
+
+            if (!token || !dataSourceId) {
+              core.setFailed("Notion configuration is missing");
+              return;
+            }
+
+            if (!pr?.merged) {
+              core.info("PR was closed without merge. Skipping.");
+              return;
+            }
+
+            // ------------------------------------
+            // 2. Resolve Ticket ID
+            // ------------------------------------
+
+            const branch = pr.head.ref;
+
+            const match = branch.match(
+              /^(feat|fix|refactor|hotfix)\/(DEMO-\d+)-[a-z0-9-]+$/i
+            );
+
+            if (!match) {
+              core.setFailed(`Invalid branch: ${branch}`);
+              return;
+            }
+
+            const ticketId = match[2].toUpperCase();
+            const [prefix, number] = ticketId.split("-");
+
+            core.info(`Merged PR: ${pr.html_url}`);
+            core.info(`Looking for ticket: ${ticketId}`);
+
+            // ------------------------------------
+            // 3. Find Notion Ticket
+            // ------------------------------------
+
+            const response = await fetch(
+              `https://api.notion.com/v1/data_sources/${dataSourceId}/query`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  "Notion-Version": "2026-03-11",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  filter: {
+                    property: "Task ID",
+                    unique_id: {
+                      equals: Number(number),
+                    },
+                  },
+                }),
+              }
+            );
+
+            if (!response.ok) {
+              core.setFailed(
+                `Notion query failed: HTTP ${response.status}`
+              );
+              return;
+            }
+
+            const data = await response.json();
+
+            const tickets = data.results.filter((page) => {
+              const id = page.properties?.["Task ID"]?.unique_id;
+
+              return (
+                id?.prefix === prefix &&
+                id?.number === Number(number)
+              );
+            });
+
+            if (tickets.length !== 1 || data.has_more) {
+              core.setFailed(`Cannot resolve ticket ${ticketId}`);
+              return;
+            }
+
+            const ticket = tickets[0];
+            const properties = ticket.properties;
+
+            // ------------------------------------
+            // 4. Validate Ticket
+            // ------------------------------------
+
+            const repository =
+              properties.Repository?.select?.name;
+
+            if (repository !== "Backend") {
+              core.setFailed("Repository mismatch");
+              return;
+            }
+
+            if (
+              properties.Status?.type !== "status" ||
+              properties["PR URL"]?.type !== "url"
+            ) {
+              core.setFailed("Invalid Notion property types");
+              return;
+            }
+
+            const linkedPr = properties["PR URL"].url;
+
+            if (linkedPr !== pr.html_url) {
+              core.setFailed(
+                "Notion ticket is linked to a different PR"
+              );
+              return;
+            }
+
+            // ------------------------------------
+            // 5. Update Task Status
+            // ------------------------------------
+
+            const updateResponse = await fetch(
+              `https://api.notion.com/v1/pages/${ticket.id}`,
+              {
+                method: "PATCH",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  "Notion-Version": "2026-03-11",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  properties: {
+                    Status: {
+                      status: {
+                        name: "Done",
+                      },
+                    },
+                  },
+                }),
+              }
+            );
+
+            if (!updateResponse.ok) {
+              core.setFailed(
+                `Notion update failed: HTTP ${updateResponse.status}`
+              );
+              return;
+            }
+
+            core.info(`Ticket ${ticketId} updated successfully`);
+            core.info("Status: Done");
+            core.info("PR merge synchronization completed");
