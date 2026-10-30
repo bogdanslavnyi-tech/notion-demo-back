@@ -1,0 +1,195 @@
+
+name: Sync CI to Notion
+
+on:
+  workflow_run:
+    workflows: ["Backend CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  sync:
+    name: Update Notion CI Status
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync CI result
+        uses: actions/github-script@v7
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATA_SOURCE_ID: ${{ vars.NOTION_DATA_SOURCE_ID }}
+
+        with:
+          script: |
+            // ------------------------------------
+            // 1. Configuration
+            // ------------------------------------
+
+            const token = process.env.NOTION_TOKEN;
+            const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
+            const run = context.payload.workflow_run;
+
+            if (!token || !dataSourceId) {
+              core.setFailed("Notion configuration is missing");
+              return;
+            }
+
+            if (run.event !== "pull_request") {
+              core.info("Not a PR workflow. Skipping.");
+              return;
+            }
+
+            const prReference = run.pull_requests?.[0];
+
+            if (!prReference) {
+              core.warning("No associated PR in workflow_run payload");
+              return;
+            }
+
+            // ------------------------------------
+            // 2. Fetch current PR
+            // ------------------------------------
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prReference.number,
+            });
+
+            if (pr.state !== "open") {
+              core.info("PR is no longer open. Skipping.");
+              return;
+            }
+
+            // Do not overwrite results from newer commits
+            if (pr.head.sha !== run.head_sha) {
+              core.info("Outdated CI run. Skipping.");
+              return;
+            }
+
+            const branch = pr.head.ref;
+
+            const match = branch.match(
+              /^(feat|fix|refactor|hotfix)\/(DEMO-\d+)-[a-z0-9-]+$/i
+            );
+
+            if (!match) {
+              core.setFailed(`Invalid branch: ${branch}`);
+              return;
+            }
+
+            const ticketId = match[2].toUpperCase();
+            const [prefix, number] = ticketId.split("-");
+
+            // ------------------------------------
+            // 3. Resolve Notion ticket
+            // ------------------------------------
+
+            const response = await fetch(
+              `https://api.notion.com/v1/data_sources/${dataSourceId}/query`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  "Notion-Version": "2026-03-11",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  filter: {
+                    property: "Task ID",
+                    unique_id: {
+                      equals: Number(number),
+                    },
+                  },
+                }),
+              }
+            );
+
+            if (!response.ok) {
+              core.setFailed(
+                `Notion query failed: HTTP ${response.status}`
+              );
+              return;
+            }
+
+            const data = await response.json();
+
+            const tickets = data.results.filter((page) => {
+              const id = page.properties?.["Task ID"]?.unique_id;
+
+              return (
+                id?.prefix === prefix &&
+                id?.number === Number(number)
+              );
+            });
+
+            if (tickets.length !== 1 || data.has_more) {
+              core.setFailed(`Cannot resolve ticket ${ticketId}`);
+              return;
+            }
+
+            const ticket = tickets[0];
+
+            const repository =
+              ticket.properties?.Repository?.select?.name;
+
+            if (repository !== "Backend") {
+              core.setFailed("Repository mismatch");
+              return;
+            }
+
+            if (ticket.properties?.["CI Status"]?.type !== "select") {
+              core.setFailed("CI Status must be a Select property");
+              return;
+            }
+
+            // ------------------------------------
+            // 4. Determine CI result
+            // ------------------------------------
+
+            const ciStatus =
+              run.conclusion === "success"
+                ? "Passed"
+                : "Failed";
+
+            core.info(`Ticket: ${ticketId}`);
+            core.info(`CI conclusion: ${run.conclusion}`);
+            core.info(`New Notion CI Status: ${ciStatus}`);
+
+            // ------------------------------------
+            // 5. Update Notion
+            // ------------------------------------
+
+            const updateResponse = await fetch(
+              `https://api.notion.com/v1/pages/${ticket.id}`,
+              {
+                method: "PATCH",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  "Notion-Version": "2026-03-11",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  properties: {
+                    "CI Status": {
+                      select: {
+                        name: ciStatus,
+                      },
+                    },
+                  },
+                }),
+              }
+            );
+
+            if (!updateResponse.ok) {
+              core.setFailed(
+                `Notion update failed: HTTP ${updateResponse.status}`
+              );
+              return;
+            }
+
+            core.info(`Successfully updated ${ticketId}`);
+            core.info(`CI Status: ${ciStatus}`);
