@@ -13,3 +13,4 @@ npm run build
 ## Notion Integration Test
 
 Testing automatic Notion ticket validation.
+Add new testing command!
