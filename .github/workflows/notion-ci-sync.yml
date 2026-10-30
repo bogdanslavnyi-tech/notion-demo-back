@@ -42,16 +42,21 @@ jobs:
               return;
             }
 
+            if (!["success", "failure", "timed_out", "cancelled"].includes(run.conclusion)) {
+              core.info(`Unsupported CI conclusion: ${run.conclusion}`);
+              return;
+            }
+
+            // ------------------------------------
+            // 2. Resolve Pull Request
+            // ------------------------------------
+
             const prReference = run.pull_requests?.[0];
 
             if (!prReference) {
               core.warning("No associated PR in workflow_run payload");
               return;
             }
-
-            // ------------------------------------
-            // 2. Fetch current PR
-            // ------------------------------------
 
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
@@ -64,11 +69,32 @@ jobs:
               return;
             }
 
-            // Do not overwrite results from newer commits
-            if (pr.head.sha !== run.head_sha) {
-              core.info("Outdated CI run. Skipping.");
+            // ------------------------------------
+            // 3. Validate current CI revision
+            // ------------------------------------
+
+            const currentHeadSha = pr.head.sha;
+            const currentMergeSha = pr.merge_commit_sha;
+            const ciRunSha = run.head_sha;
+
+            core.info(`PR head SHA: ${currentHeadSha}`);
+            core.info(`PR merge SHA: ${currentMergeSha}`);
+            core.info(`CI run SHA: ${ciRunSha}`);
+
+            const isCurrentRun =
+              ciRunSha === currentHeadSha ||
+              ciRunSha === currentMergeSha;
+
+            if (!isCurrentRun) {
+              core.info(
+                "CI run belongs to an outdated PR revision. Skipping."
+              );
               return;
             }
+
+            // ------------------------------------
+            // 4. Extract Notion Ticket ID
+            // ------------------------------------
 
             const branch = pr.head.ref;
 
@@ -84,8 +110,10 @@ jobs:
             const ticketId = match[2].toUpperCase();
             const [prefix, number] = ticketId.split("-");
 
+            core.info(`Looking for Notion ticket: ${ticketId}`);
+
             // ------------------------------------
-            // 3. Resolve Notion ticket
+            // 5. Find ticket in Notion
             // ------------------------------------
 
             const response = await fetch(
@@ -127,27 +155,39 @@ jobs:
             });
 
             if (tickets.length !== 1 || data.has_more) {
-              core.setFailed(`Cannot resolve ticket ${ticketId}`);
+              core.setFailed(
+                `Ticket ${ticketId} not found or duplicated`
+              );
               return;
             }
 
             const ticket = tickets[0];
 
+            // ------------------------------------
+            // 6. Validate Notion properties
+            // ------------------------------------
+
             const repository =
               ticket.properties?.Repository?.select?.name;
 
             if (repository !== "Backend") {
-              core.setFailed("Repository mismatch");
+              core.setFailed(
+                `Expected Backend repository, got: ${repository}`
+              );
               return;
             }
 
-            if (ticket.properties?.["CI Status"]?.type !== "select") {
-              core.setFailed("CI Status must be a Select property");
+            if (
+              ticket.properties?.["CI Status"]?.type !== "select"
+            ) {
+              core.setFailed(
+                "CI Status must be a Select property"
+              );
               return;
             }
 
             // ------------------------------------
-            // 4. Determine CI result
+            // 7. Determine CI status
             // ------------------------------------
 
             const ciStatus =
@@ -156,11 +196,12 @@ jobs:
                 : "Failed";
 
             core.info(`Ticket: ${ticketId}`);
+            core.info(`PR: #${pr.number}`);
             core.info(`CI conclusion: ${run.conclusion}`);
-            core.info(`New Notion CI Status: ${ciStatus}`);
+            core.info(`New CI Status: ${ciStatus}`);
 
             // ------------------------------------
-            // 5. Update Notion
+            // 8. Update Notion
             // ------------------------------------
 
             const updateResponse = await fetch(
@@ -191,5 +232,14 @@ jobs:
               return;
             }
 
-            core.info(`Successfully updated ${ticketId}`);
+            // ------------------------------------
+            // 9. Success
+            // ------------------------------------
+
+            core.info("------------------------------------");
+            core.info(`Successfully synchronized ${ticketId}`);
+            core.info(`Repository: Backend`);
+            core.info(`Branch: ${branch}`);
+            core.info(`PR: ${pr.html_url}`);
             core.info(`CI Status: ${ciStatus}`);
+            core.info("GitHub CI → Notion synchronization completed");
