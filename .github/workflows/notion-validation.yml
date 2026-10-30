@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   validate-ticket:
@@ -30,13 +31,12 @@ jobs:
             const branch = process.env.PR_BRANCH;
             const token = process.env.NOTION_TOKEN;
             const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
+            const pr = context.payload.pull_request;
 
             if (!token || !dataSourceId) {
               core.setFailed("Notion credentials are not configured");
               return;
             }
-
-            const pr = context.payload.pull_request;
 
             if (!pr) {
               core.setFailed("Pull Request payload is missing");
@@ -44,7 +44,7 @@ jobs:
             }
 
             // ------------------------------------
-            // 2. Extract ticket ID from branch
+            // 2. Extract Ticket ID
             // ------------------------------------
 
             const match = branch.match(
@@ -62,7 +62,7 @@ jobs:
             core.info(`Looking for Notion ticket: ${ticketId}`);
 
             // ------------------------------------
-            // 3. Find ticket in Notion
+            // 3. Find Ticket in Notion
             // ------------------------------------
 
             const response = await fetch(
@@ -113,7 +113,7 @@ jobs:
             const ticket = tickets[0];
 
             // ------------------------------------
-            // 4. Validate repository
+            // 4. Validate Repository
             // ------------------------------------
 
             const repository =
@@ -130,7 +130,7 @@ jobs:
             core.info(`Repository: ${repository}`);
 
             // ------------------------------------
-            // 5. Validate Notion properties
+            // 5. Validate Notion Properties
             // ------------------------------------
 
             const properties = ticket.properties;
@@ -155,7 +155,7 @@ jobs:
             ];
 
             // ------------------------------------
-            // 6. Prepare Notion update
+            // 6. Prepare Notion Update
             // ------------------------------------
 
             const updatedProperties = {
@@ -203,23 +203,128 @@ jobs:
             );
 
             if (!updateResponse.ok) {
-              const error = await updateResponse.text();
-
-              core.error(
+              core.setFailed(
                 `Notion update failed: HTTP ${updateResponse.status}`
               );
-              core.debug(error);
-              core.setFailed("GitHub → Notion synchronization failed");
               return;
             }
 
+            core.info(`Notion ticket ${ticketId} updated successfully`);
+
             // ------------------------------------
-            // 8. Success
+            // 8. Prepare Notion Link for PR
             // ------------------------------------
 
-            core.info(`Ticket ${ticketId} validated successfully`);
-            core.info(`Notion ticket updated successfully`);
-            core.info(`PR URL: ${pr.html_url}`);
+            const notionUrl = ticket.url;
+
+            if (!notionUrl) {
+              core.setFailed("Notion ticket URL is missing");
+              return;
+            }
+
+            const markerStart = "<!-- notion-task:start -->";
+            const markerEnd = "<!-- notion-task:end -->";
+
+            const notionBlock = [
+              markerStart,
+              "### Linked Notion Task",
+              "",
+              `[${ticketId}](${notionUrl})`,
+              markerEnd,
+            ].join("\n");
+
+            // ------------------------------------
+            // 9. Fetch Latest PR Description
+            // ------------------------------------
+
+            const { data: currentPr } =
+              await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+              });
+
+            const originalBody = currentPr.body || "";
+            let updatedBody = originalBody;
+
+            const startIndex =
+              updatedBody.indexOf(markerStart);
+
+            const endIndex =
+              updatedBody.indexOf(markerEnd);
+
+            // ------------------------------------
+            // 10. Update or Append Notion Link
+            // ------------------------------------
+
+            if (startIndex !== -1 && endIndex !== -1) {
+              if (endIndex < startIndex) {
+                core.setFailed(
+                  "Invalid Notion markers in PR description"
+                );
+                return;
+              }
+
+              updatedBody =
+                updatedBody.slice(0, startIndex) +
+                notionBlock +
+                updatedBody.slice(
+                  endIndex + markerEnd.length
+                );
+            } else if (
+              startIndex !== -1 ||
+              endIndex !== -1
+            ) {
+              core.setFailed(
+                "Incomplete Notion markers in PR description"
+              );
+              return;
+            } else {
+              updatedBody = [
+                updatedBody.trim(),
+                notionBlock,
+              ]
+                .filter(Boolean)
+                .join("\n\n");
+            }
+
+            // ------------------------------------
+            // 11. Synchronize Notion → GitHub PR
+            // ------------------------------------
+
+            if (updatedBody !== originalBody) {
+              try {
+                await github.rest.pulls.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  body: updatedBody,
+                });
+
+                core.info(
+                  `Notion link added to PR #${pr.number}`
+                );
+              } catch (error) {
+                core.setFailed(
+                  `Failed to update PR description: ${error.message}`
+                );
+                return;
+              }
+            } else {
+              core.info(
+                "Notion link is already up to date"
+              );
+            }
+
+            // ------------------------------------
+            // 12. Success
+            // ------------------------------------
+
+            core.info("------------------------------------");
+            core.info(`Ticket: ${ticketId}`);
+            core.info(`Repository: ${repository}`);
             core.info(`Branch: ${branch}`);
-            core.info(`Status: ${currentStatus}`);
-            core.info("GitHub → Notion synchronization completed");
+            core.info(`PR URL: ${pr.html_url}`);
+            core.info(`Notion URL: ${notionUrl}`);
+            core.info(`Status before sync: ${currentStatus}`);
+            core.info("GitHub ↔ Notion synchronization completed");
