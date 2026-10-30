@@ -29,7 +29,11 @@ jobs:
         run: npm run lint
 
       - name: Unit tests
+<<<<<<< HEAD
         run: npm test -- --runInBand
+=======
+        run: npm test
+>>>>>>> 84483b4064a65c83451d577d41c31a9347b1b7e5
 
       - name: Build
         run: npm run build
