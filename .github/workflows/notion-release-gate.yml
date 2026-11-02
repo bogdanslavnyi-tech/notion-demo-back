@@ -1,0 +1,317 @@
+name: Notion Release Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-gate:
+    name: Notion Release Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate release
+        uses: actions/github-script@v7
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATA_SOURCE_ID: ${{ vars.NOTION_DATA_SOURCE_ID }}
+
+        with:
+          script: |
+            const token = process.env.NOTION_TOKEN;
+            const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
+            const pr = context.payload.pull_request;
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            if (!token || !dataSourceId) {
+              core.setFailed("Notion configuration is missing");
+              return;
+            }
+
+            if (!pr || pr.base.ref !== "main") {
+              core.setFailed("Expected a PR targeting main");
+              return;
+            }
+
+            if (pr.draft) {
+              core.setFailed("Draft PR cannot be released");
+              return;
+            }
+
+            const headers = {
+              Authorization: `Bearer ${token}`,
+              "Notion-Version": "2026-03-11",
+              "Content-Type": "application/json",
+            };
+
+            const notionRequest = async (url, options = {}) => {
+              const response = await fetch(url, {
+                ...options,
+                headers,
+              });
+
+              if (!response.ok) {
+                const error = await response.text();
+
+                throw new Error(
+                  `Notion HTTP ${response.status}: ${error}`
+                );
+              }
+
+              return response.json();
+            };
+
+            // ------------------------------------
+            // 1. Resolve Notion ticket
+            // ------------------------------------
+
+            const findTicket = async (ticketId) => {
+              const [prefix, number] = ticketId.split("-");
+
+              const result = await notionRequest(
+                `https://api.notion.com/v1/data_sources/${dataSourceId}/query`,
+                {
+                  method: "POST",
+                  body: JSON.stringify({
+                    filter: {
+                      property: "Task ID",
+                      unique_id: {
+                        equals: Number(number),
+                      },
+                    },
+                  }),
+                }
+              );
+
+              if (result.has_more) {
+                throw new Error(
+                  `Ambiguous Notion results for ${ticketId}`
+                );
+              }
+
+              const matches = result.results.filter((page) => {
+                const id = page.properties?.["Task ID"]?.unique_id;
+
+                return (
+                  id?.prefix?.toUpperCase() === prefix &&
+                  id?.number === Number(number)
+                );
+              });
+
+              if (matches.length !== 1) {
+                throw new Error(
+                  `Cannot resolve Notion ticket ${ticketId}`
+                );
+              }
+
+              const ticket = matches[0];
+
+              const repository =
+                ticket.properties?.Repository?.select?.name;
+
+              if (repository !== "Backend") {
+                throw new Error(
+                  `${ticketId}: Expected Backend, got ${repository}`
+                );
+              }
+
+              return ticket;
+            };
+
+            const ticketFromBranch = (branch) => {
+              const match = branch.match(
+                /^(feat|fix|refactor|hotfix)\/(DEMO-\d+)-[a-z0-9-]+$/i
+              );
+
+              if (!match) {
+                throw new Error(
+                  `Invalid branch name: ${branch}`
+                );
+              }
+
+              return match[2].toUpperCase();
+            };
+
+            // ------------------------------------
+            // 2. Hotfix → main
+            // ------------------------------------
+
+            if (/^hotfix\//i.test(pr.head.ref)) {
+              const ticketId = ticketFromBranch(pr.head.ref);
+
+              await findTicket(ticketId);
+
+              core.info(`Hotfix PR: ${pr.html_url}`);
+              core.info(`Ticket: ${ticketId}`);
+              core.info("Hotfix is exempt from pre-merge QA");
+              core.info("Backend CI and Code Review remain required");
+              core.info("Notion Release Gate passed");
+              return;
+            }
+
+            // ------------------------------------
+            // 3. Block ordinary branches → main
+            // ------------------------------------
+
+            if (pr.head.ref !== "develop") {
+              core.setFailed(
+                `Direct PR from ${pr.head.ref} to main is forbidden. ` +
+                "Only develop and hotfix/* are allowed."
+              );
+              return;
+            }
+
+            // ------------------------------------
+            // 4. Find source PRs included in release
+            // ------------------------------------
+
+            const commits = await github.paginate(
+              github.rest.pulls.listCommits,
+              {
+                owner,
+                repo,
+                pull_number: pr.number,
+                per_page: 100,
+              }
+            );
+
+            if (commits.length === 0) {
+              core.setFailed("Release contains no commits");
+              return;
+            }
+
+            const sourcePRs = new Map();
+
+            for (const commit of commits) {
+              const associated = await github.paginate(
+                github.rest.repos.listPullRequestsAssociatedWithCommit,
+                {
+                  owner,
+                  repo,
+                  commit_sha: commit.sha,
+                  per_page: 100,
+                }
+              );
+
+              for (const sourcePR of associated) {
+                if (
+                  !sourcePR.merged_at ||
+                  sourcePR.base.ref !== "develop"
+                ) {
+                  continue;
+                }
+
+                // Only count PRs whose integration commit
+                // is actually present in the release.
+                if (sourcePR.merge_commit_sha !== commit.sha) {
+                  continue;
+                }
+
+                sourcePRs.set(sourcePR.number, sourcePR);
+              }
+            }
+
+            if (sourcePRs.size === 0) {
+              core.setFailed(
+                "No merged develop PRs found in release. " +
+                "Cannot safely determine release tickets."
+              );
+              return;
+            }
+
+            // ------------------------------------
+            // 5. Validate all release tickets
+            // ------------------------------------
+
+            let failures = 0;
+            const checkedTickets = new Set();
+
+            for (const sourcePR of sourcePRs.values()) {
+              try {
+                const ticketId = ticketFromBranch(
+                  sourcePR.head.ref
+                );
+
+                if (checkedTickets.has(ticketId)) {
+                  continue;
+                }
+
+                checkedTickets.add(ticketId);
+
+                const ticket = await findTicket(ticketId);
+                const properties = ticket.properties;
+
+                if (
+                  properties.Status?.type !== "status" ||
+                  properties["QA Approved"]?.type !== "checkbox" ||
+                  properties["AC Approved"]?.type !== "checkbox"
+                ) {
+                  throw new Error(
+                    `${ticketId}: Invalid Notion property types`
+                  );
+                }
+
+                const status =
+                  properties.Status.status?.name;
+
+                const qaApproved =
+                  properties["QA Approved"].checkbox;
+
+                const acApproved =
+                  properties["AC Approved"].checkbox;
+
+                const allowed =
+                  status === "Ready For Merge" &&
+                  qaApproved === true &&
+                  acApproved === true;
+
+                core.info("------------------------------------");
+                core.info(`Ticket: ${ticketId}`);
+                core.info(`Source PR: ${sourcePR.html_url}`);
+                core.info(`Status: ${status}`);
+                core.info(`QA Approved: ${qaApproved}`);
+                core.info(`AC Approved: ${acApproved}`);
+
+                if (!allowed) {
+                  throw new Error(
+                    `${ticketId} is not ready for release`
+                  );
+                }
+
+                core.info(`${ticketId}: Approved for release`);
+              } catch (error) {
+                failures++;
+                core.error(error.message);
+              }
+            }
+
+            // ------------------------------------
+            // 6. Final result
+            // ------------------------------------
+
+            core.info("------------------------------------");
+            core.info(`Source PRs: ${sourcePRs.size}`);
+            core.info(`Tickets checked: ${checkedTickets.size}`);
+            core.info(`Failures: ${failures}`);
+
+            if (failures > 0) {
+              core.setFailed(
+                `Release blocked: ${failures} validation errors`
+              );
+              return;
+            }
+
+            core.info("Notion Release Gate passed");
