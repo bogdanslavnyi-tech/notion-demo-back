@@ -111,12 +111,3 @@ develop → Release Validation → main → Notion: Done
 ## Definition of Done
 
 The automation is considered complete when the entire workflow can be executed without manually updating technical task statuses or copying GitHub links.
-
-### Required Workflow
-
-1. **Backlog** — Task created in Notion.
-2. **In Progress** — GitHub branch created from `develop`.
-3. **In Review** — Pull Request opened.
-4. **In QA** — Pull Request merged into `develop`.
-5. **Ready For Merge** — QA approved all requirements.
-6. **Done** — Release merged into `main`.
