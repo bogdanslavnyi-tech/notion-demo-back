@@ -3,6 +3,8 @@ name: Notion Validation
 
 on:
   pull_request_target:
+    branches:
+      - develop
     types: [opened, reopened, synchronize]
 
 permissions:

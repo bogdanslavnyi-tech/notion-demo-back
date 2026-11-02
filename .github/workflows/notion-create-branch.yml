@@ -1,0 +1,344 @@
+
+name: Create Git Branch from Notion
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: notion-branch-creation
+  cancel-in-progress: false
+
+jobs:
+  create-branches:
+    name: Process Notion Branch Requests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create requested branches
+        uses: actions/github-script@v7
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATA_SOURCE_ID: ${{ vars.NOTION_DATA_SOURCE_ID }}
+
+        with:
+          script: |
+            // ------------------------------------
+            // 1. Configuration
+            // ------------------------------------
+
+            const token = process.env.NOTION_TOKEN;
+            const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
+
+            if (!token || !dataSourceId) {
+              core.setFailed("Notion configuration is missing");
+              return;
+            }
+
+            const headers = {
+              Authorization: `Bearer ${token}`,
+              "Notion-Version": "2026-03-11",
+              "Content-Type": "application/json",
+            };
+
+            const notionRequest = async (url, options = {}) => {
+              const response = await fetch(url, {
+                ...options,
+                headers,
+              });
+
+              if (!response.ok) {
+                throw new Error(
+                  `Notion API error: HTTP ${response.status}`
+                );
+              }
+
+              return response.json();
+            };
+
+            // ------------------------------------
+            // 2. Find Pending Branch Requests
+            // ------------------------------------
+
+            const pendingTasks = [];
+            let cursor;
+
+            do {
+              const body = {
+                page_size: 100,
+                filter: {
+                  property: "Create Branch Requested",
+                  checkbox: {
+                    equals: true,
+                  },
+                },
+              };
+
+              if (cursor) {
+                body.start_cursor = cursor;
+              }
+
+              const result = await notionRequest(
+                `https://api.notion.com/v1/data_sources/${dataSourceId}/query`,
+                {
+                  method: "POST",
+                  body: JSON.stringify(body),
+                }
+              );
+
+              pendingTasks.push(...result.results);
+
+              cursor = result.has_more
+                ? result.next_cursor
+                : undefined;
+            } while (cursor);
+
+            core.info(
+              `Found ${pendingTasks.length} pending branch requests`
+            );
+
+            // ------------------------------------
+            // 3. Process Tasks
+            // ------------------------------------
+
+            let failures = 0;
+
+            for (const task of pendingTasks) {
+              try {
+                const properties = task.properties;
+
+                const repository =
+                  properties.Repository?.select?.name;
+
+                // This workflow only handles Backend tasks
+                if (repository !== "Backend") {
+                  continue;
+                }
+
+                // ------------------------------------
+                // 4. Validate Task ID
+                // ------------------------------------
+
+                const taskId =
+                  properties["Task ID"]?.unique_id;
+
+                if (!taskId?.number || !taskId?.prefix) {
+                  throw new Error("Task ID is missing");
+                }
+
+                const ticketId =
+                  `${taskId.prefix}-${taskId.number}`;
+
+                core.info(`Processing ticket: ${ticketId}`);
+
+                // ------------------------------------
+                // 5. Validate Generated Branch
+                // ------------------------------------
+
+                const branch =
+                  properties["Git Branch"]?.formula?.string;
+
+                if (!branch) {
+                  throw new Error(
+                    `Git Branch formula is empty for ${ticketId}`
+                  );
+                }
+
+                const branchPattern =
+                  /^(feat|fix|refactor|hotfix)\/DEMO-\d+-[a-z0-9-]+$/;
+
+                if (!branchPattern.test(branch)) {
+                  throw new Error(
+                    `Invalid generated branch: ${branch}`
+                  );
+                }
+
+                if (!branch.includes(`/${ticketId}-`)) {
+                  throw new Error(
+                    "Branch does not match Task ID"
+                  );
+                }
+
+                // ------------------------------------
+                // 6. Check Existing Notion Branch
+                // ------------------------------------
+
+                const existingBranch =
+                  properties.Branch?.rich_text
+                    ?.map((item) => item.plain_text)
+                    .join("") || "";
+
+                if (existingBranch) {
+                  core.info(
+                    `Existing Notion branch: ${existingBranch}`
+                  );
+                }
+
+                // A different branch is already linked
+                if (
+                  existingBranch &&
+                  existingBranch !== branch
+                ) {
+                  throw new Error(
+                    `Branch mismatch for ${ticketId}: ` +
+                    `expected ${branch}, found ${existingBranch}`
+                  );
+                }
+
+                // ------------------------------------
+                // 7. Validate Task Status
+                // ------------------------------------
+
+                const status =
+                  properties.Status?.status?.name;
+
+                const allowedStatuses = [
+                  "Backlog",
+                  "In Progress",
+                ];
+
+                if (!allowedStatuses.includes(status)) {
+                  throw new Error(
+                    `Invalid task status: ${status}`
+                  );
+                }
+
+                // ------------------------------------
+                // 8. Check GitHub Branch
+                // ------------------------------------
+
+                let branchExists = false;
+
+                try {
+                  await github.rest.git.getRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: `heads/${branch}`,
+                  });
+
+                  branchExists = true;
+                } catch (error) {
+                  if (error.status !== 404) {
+                    throw error;
+                  }
+                }
+
+                // ------------------------------------
+                // 9. Create Branch from develop
+                // ------------------------------------
+
+                if (!branchExists) {
+                  // A linked branch was deleted from GitHub.
+                  // Do not silently recreate it.
+                  if (existingBranch === branch) {
+                    throw new Error(
+                      `Linked branch ${branch} is missing in GitHub`
+                    );
+                  }
+
+                  const { data: develop } =
+                    await github.rest.git.getRef({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      ref: "heads/develop",
+                    });
+
+                  const developSha = develop.object.sha;
+
+                  await github.rest.git.createRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: `refs/heads/${branch}`,
+                    sha: developSha,
+                  });
+
+                  core.info(
+                    `Created ${branch} from develop`
+                  );
+                } else {
+                  core.info(
+                    `Branch already exists: ${branch}`
+                  );
+                }
+
+                // ------------------------------------
+                // 10. Synchronize Notion
+                // ------------------------------------
+
+                const updatedProperties = {
+                  "Create Branch Requested": {
+                    checkbox: false,
+                  },
+                };
+
+                // Update Branch only if necessary
+                if (existingBranch !== branch) {
+                  updatedProperties.Branch = {
+                    rich_text: [
+                      {
+                        text: {
+                          content: branch,
+                        },
+                      },
+                    ],
+                  };
+                }
+
+                // Update status only when in Backlog
+                if (status === "Backlog") {
+                  updatedProperties.Status = {
+                    status: {
+                      name: "In Progress",
+                    },
+                  };
+                }
+
+                await notionRequest(
+                  `https://api.notion.com/v1/pages/${task.id}`,
+                  {
+                    method: "PATCH",
+                    body: JSON.stringify({
+                      properties: updatedProperties,
+                    }),
+                  }
+                );
+
+                // ------------------------------------
+                // 11. Success
+                // ------------------------------------
+
+                core.info("------------------------------------");
+                core.info(`Ticket: ${ticketId}`);
+                core.info(`Branch: ${branch}`);
+                core.info(
+                  branchExists
+                    ? "Existing GitHub branch verified"
+                    : "New GitHub branch created"
+                );
+                core.info("Notion synchronization completed");
+              } catch (error) {
+                failures++;
+
+                core.error(
+                  `Task ${task.id}: ${error.message}`
+                );
+              }
+            }
+
+            // ------------------------------------
+            // 12. Final Result
+            // ------------------------------------
+
+            if (failures > 0) {
+              core.setFailed(
+                `${failures} branch requests failed`
+              );
+            } else {
+              core.info(
+                "All branch requests processed successfully"
+              );
+            }

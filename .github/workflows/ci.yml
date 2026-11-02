@@ -2,7 +2,13 @@ name: Backend CI
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    branches:
+      - develop
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
 
 permissions:
   contents: read

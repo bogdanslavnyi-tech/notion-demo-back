@@ -41,6 +41,14 @@ jobs:
               return;
             }
 
+            // Only process feature PRs merged into develop
+            if (pr.base.ref !== "develop") {
+              core.info(
+                `Skipping merge into ${pr.base.ref}. Expected develop.`
+              );
+              return;
+            }
+
             // ------------------------------------
             // 2. Resolve Ticket ID
             // ------------------------------------
@@ -158,7 +166,7 @@ jobs:
                   properties: {
                     Status: {
                       status: {
-                        name: "Done",
+                        name: "In QA",
                       },
                     },
                   },
@@ -174,5 +182,5 @@ jobs:
             }
 
             core.info(`Ticket ${ticketId} updated successfully`);
-            core.info("Status: Done");
-            core.info("PR merge synchronization completed");
+            core.info("Status: In QA");
+            core.info("Feature PR merged into develop");

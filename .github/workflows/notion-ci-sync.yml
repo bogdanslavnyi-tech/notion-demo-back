@@ -42,8 +42,17 @@ jobs:
               return;
             }
 
-            if (!["success", "failure", "timed_out", "cancelled"].includes(run.conclusion)) {
-              core.info(`Unsupported CI conclusion: ${run.conclusion}`);
+            const supportedConclusions = [
+              "success",
+              "failure",
+              "timed_out",
+              "cancelled",
+            ];
+
+            if (!supportedConclusions.includes(run.conclusion)) {
+              core.info(
+                `Unsupported CI conclusion: ${run.conclusion}`
+              );
               return;
             }
 
@@ -54,7 +63,9 @@ jobs:
             const prReference = run.pull_requests?.[0];
 
             if (!prReference) {
-              core.warning("No associated PR in workflow_run payload");
+              core.warning(
+                "No associated PR in workflow_run payload"
+              );
               return;
             }
 
@@ -70,20 +81,85 @@ jobs:
             }
 
             // ------------------------------------
-            // 3. Validate current CI revision
+            // 3. Validate Target Branch
             // ------------------------------------
 
-            const currentHeadSha = pr.head.sha;
-            const currentMergeSha = pr.merge_commit_sha;
+            // Only sync feature PRs targeting develop.
+            // Release PRs targeting main are handled separately.
+
+            if (pr.base.ref !== "develop") {
+              core.info(
+                `Skipping PR targeting ${pr.base.ref}`
+              );
+              core.info(
+                "Only feature PRs targeting develop are synchronized"
+              );
+              return;
+            }
+
+            core.info("Target branch: develop");
+
+            // ------------------------------------
+            // 4. Validate Current CI Revision
+            // ------------------------------------
+
             const ciRunSha = run.head_sha;
+            const currentHeadSha = pr.head.sha;
+
+            let currentMergeSha = pr.merge_commit_sha;
+            let mergeable = pr.mergeable;
 
             core.info(`PR head SHA: ${currentHeadSha}`);
-            core.info(`PR merge SHA: ${currentMergeSha}`);
             core.info(`CI run SHA: ${ciRunSha}`);
+
+            // GitHub may calculate mergeability asynchronously.
+            // Wait until the merge commit is available.
+
+            if (mergeable === null) {
+              core.info(
+                "Waiting for GitHub mergeability calculation..."
+              );
+
+              for (let attempt = 1; attempt <= 5; attempt++) {
+                await new Promise((resolve) =>
+                  setTimeout(resolve, 2000)
+                );
+
+                const { data: updatedPr } =
+                  await github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                  });
+
+                mergeable = updatedPr.mergeable;
+                currentMergeSha = updatedPr.merge_commit_sha;
+
+                core.info(
+                  `Attempt ${attempt}: mergeable=${mergeable}`
+                );
+
+                if (mergeable !== null) {
+                  break;
+                }
+              }
+            }
+
+            core.info(`PR merge SHA: ${currentMergeSha}`);
+
+            if (mergeable === null) {
+              core.setFailed(
+                "GitHub mergeability calculation timed out"
+              );
+              return;
+            }
 
             const isCurrentRun =
               ciRunSha === currentHeadSha ||
-              ciRunSha === currentMergeSha;
+              (
+                mergeable === true &&
+                ciRunSha === currentMergeSha
+              );
 
             if (!isCurrentRun) {
               core.info(
@@ -92,8 +168,12 @@ jobs:
               return;
             }
 
+            core.info(
+              "CI run matches the current PR revision"
+            );
+
             // ------------------------------------
-            // 4. Extract Notion Ticket ID
+            // 5. Extract Notion Ticket ID
             // ------------------------------------
 
             const branch = pr.head.ref;
@@ -110,10 +190,12 @@ jobs:
             const ticketId = match[2].toUpperCase();
             const [prefix, number] = ticketId.split("-");
 
-            core.info(`Looking for Notion ticket: ${ticketId}`);
+            core.info(
+              `Looking for Notion ticket: ${ticketId}`
+            );
 
             // ------------------------------------
-            // 5. Find ticket in Notion
+            // 6. Find Ticket in Notion
             // ------------------------------------
 
             const response = await fetch(
@@ -164,7 +246,7 @@ jobs:
             const ticket = tickets[0];
 
             // ------------------------------------
-            // 6. Validate Notion properties
+            // 7. Validate Notion Properties
             // ------------------------------------
 
             const repository =
@@ -187,7 +269,7 @@ jobs:
             }
 
             // ------------------------------------
-            // 7. Determine CI status
+            // 8. Determine CI Status
             // ------------------------------------
 
             const ciStatus =
@@ -201,7 +283,7 @@ jobs:
             core.info(`New CI Status: ${ciStatus}`);
 
             // ------------------------------------
-            // 8. Update Notion
+            // 9. Update Notion
             // ------------------------------------
 
             const updateResponse = await fetch(
@@ -233,13 +315,16 @@ jobs:
             }
 
             // ------------------------------------
-            // 9. Success
+            // 10. Success
             // ------------------------------------
 
             core.info("------------------------------------");
             core.info(`Successfully synchronized ${ticketId}`);
-            core.info(`Repository: Backend`);
+            core.info("Repository: Backend");
+            core.info("Target branch: develop");
             core.info(`Branch: ${branch}`);
             core.info(`PR: ${pr.html_url}`);
             core.info(`CI Status: ${ciStatus}`);
-            core.info("GitHub CI → Notion synchronization completed");
+            core.info(
+              "GitHub CI → Notion synchronization completed"
+            );
