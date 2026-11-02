@@ -1,4 +1,3 @@
-
 name: Sync PR Merge to Notion
 
 on:
@@ -7,6 +6,11 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
+
+concurrency:
+  group: notion-merge-sync
+  cancel-in-progress: false
 
 jobs:
   sync-merge:
@@ -23,13 +27,12 @@ jobs:
 
         with:
           script: |
-            // ------------------------------------
-            // 1. Configuration
-            // ------------------------------------
-
             const token = process.env.NOTION_TOKEN;
             const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
             const pr = context.payload.pull_request;
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
 
             if (!token || !dataSourceId) {
               core.setFailed("Notion configuration is missing");
@@ -37,150 +40,452 @@ jobs:
             }
 
             if (!pr?.merged) {
-              core.info("PR was closed without merge. Skipping.");
+              core.info("PR was not merged. Skipping.");
               return;
             }
 
-            // Only process feature PRs merged into develop
-            if (pr.base.ref !== "develop") {
-              core.info(
-                `Skipping merge into ${pr.base.ref}. Expected develop.`
-              );
-              return;
-            }
+            const headers = {
+              Authorization: `Bearer ${token}`,
+              "Notion-Version": "2026-03-11",
+              "Content-Type": "application/json",
+            };
 
-            // ------------------------------------
-            // 2. Resolve Ticket ID
-            // ------------------------------------
-
-            const branch = pr.head.ref;
-
-            const match = branch.match(
-              /^(feat|fix|refactor|hotfix)\/(DEMO-\d+)-[a-z0-9-]+$/i
-            );
-
-            if (!match) {
-              core.setFailed(`Invalid branch: ${branch}`);
-              return;
-            }
-
-            const ticketId = match[2].toUpperCase();
-            const [prefix, number] = ticketId.split("-");
-
-            core.info(`Merged PR: ${pr.html_url}`);
-            core.info(`Looking for ticket: ${ticketId}`);
-
-            // ------------------------------------
-            // 3. Find Notion Ticket
-            // ------------------------------------
-
-            const response = await fetch(
-              `https://api.notion.com/v1/data_sources/${dataSourceId}/query`,
-              {
-                method: "POST",
+            const notionRequest = async (url, options = {}) => {
+              const response = await fetch(url, {
+                ...options,
                 headers: {
-                  Authorization: `Bearer ${token}`,
-                  "Notion-Version": "2026-03-11",
-                  "Content-Type": "application/json",
+                  ...headers,
+                  ...options.headers,
                 },
-                body: JSON.stringify({
-                  filter: {
-                    property: "Task ID",
-                    unique_id: {
-                      equals: Number(number),
-                    },
-                  },
-                }),
+              });
+
+              if (!response.ok) {
+                const error = await response.text();
+
+                throw new Error(
+                  `Notion API HTTP ${response.status}: ${error}`
+                );
               }
-            );
 
-            if (!response.ok) {
-              core.setFailed(
-                `Notion query failed: HTTP ${response.status}`
+              return response.json();
+            };
+
+            // ------------------------------------
+            // 1. Resolve ticket ID
+            // ------------------------------------
+
+            const getTicketId = (branch) => {
+              const match = branch.match(
+                /^(feat|fix|refactor|hotfix)\/(DEMO-\d+)-[a-z0-9-]+$/i
               );
-              return;
-            }
 
-            const data = await response.json();
+              if (!match) {
+                throw new Error(
+                  `Invalid ticket branch: ${branch}`
+                );
+              }
 
-            const tickets = data.results.filter((page) => {
-              const id = page.properties?.["Task ID"]?.unique_id;
-
-              return (
-                id?.prefix === prefix &&
-                id?.number === Number(number)
-              );
-            });
-
-            if (tickets.length !== 1 || data.has_more) {
-              core.setFailed(`Cannot resolve ticket ${ticketId}`);
-              return;
-            }
-
-            const ticket = tickets[0];
-            const properties = ticket.properties;
+              return match[2].toUpperCase();
+            };
 
             // ------------------------------------
-            // 4. Validate Ticket
+            // 2. Find ticket in Notion
             // ------------------------------------
 
-            const repository =
-              properties.Repository?.select?.name;
+            const findTicket = async (ticketId) => {
+              const [prefix, number] = ticketId.split("-");
 
-            if (repository !== "Backend") {
-              core.setFailed("Repository mismatch");
-              return;
-            }
-
-            if (
-              properties.Status?.type !== "status" ||
-              properties["PR URL"]?.type !== "url"
-            ) {
-              core.setFailed("Invalid Notion property types");
-              return;
-            }
-
-            const linkedPr = properties["PR URL"].url;
-
-            if (linkedPr !== pr.html_url) {
-              core.setFailed(
-                "Notion ticket is linked to a different PR"
-              );
-              return;
-            }
-
-            // ------------------------------------
-            // 5. Update Task Status
-            // ------------------------------------
-
-            const updateResponse = await fetch(
-              `https://api.notion.com/v1/pages/${ticket.id}`,
-              {
-                method: "PATCH",
-                headers: {
-                  Authorization: `Bearer ${token}`,
-                  "Notion-Version": "2026-03-11",
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  properties: {
-                    Status: {
-                      status: {
-                        name: "In QA",
+              const result = await notionRequest(
+                `https://api.notion.com/v1/data_sources/${dataSourceId}/query`,
+                {
+                  method: "POST",
+                  body: JSON.stringify({
+                    filter: {
+                      property: "Task ID",
+                      unique_id: {
+                        equals: Number(number),
                       },
                     },
-                  },
-                }),
-              }
-            );
-
-            if (!updateResponse.ok) {
-              core.setFailed(
-                `Notion update failed: HTTP ${updateResponse.status}`
+                  }),
+                }
               );
+
+              if (result.has_more) {
+                throw new Error(
+                  `Ambiguous search results for ${ticketId}`
+                );
+              }
+
+              const tickets = result.results.filter((page) => {
+                const id = page.properties?.["Task ID"]?.unique_id;
+
+                return (
+                  id?.prefix?.toUpperCase() === prefix &&
+                  id?.number === Number(number)
+                );
+              });
+
+              if (tickets.length !== 1) {
+                throw new Error(
+                  `Cannot resolve ticket ${ticketId}`
+                );
+              }
+
+              const ticket = tickets[0];
+              const properties = ticket.properties;
+
+              if (
+                properties.Repository?.select?.name !== "Backend"
+              ) {
+                throw new Error(
+                  `${ticketId}: Repository must be Backend`
+                );
+              }
+
+              if (properties.Status?.type !== "status") {
+                throw new Error(
+                  `${ticketId}: Invalid Status property`
+                );
+              }
+
+              return ticket;
+            };
+
+            // ------------------------------------
+            // 3. Update ticket status
+            // ------------------------------------
+
+            const updateTicket = async ({
+              ticketId,
+              targetStatus,
+              allowedStatuses,
+              sourcePrUrl,
+              requireQA = false,
+            }) => {
+              const ticket = await findTicket(ticketId);
+              const properties = ticket.properties;
+
+              const currentStatus =
+                properties.Status.status?.name;
+
+              core.info("------------------------------------");
+              core.info(`Ticket: ${ticketId}`);
+              core.info(`Current status: ${currentStatus}`);
+              core.info(`Target status: ${targetStatus}`);
+
+              if (sourcePrUrl) {
+                const linkedPr =
+                  properties["PR URL"]?.url;
+
+                if (linkedPr !== sourcePrUrl) {
+                  throw new Error(
+                    `${ticketId}: Linked PR mismatch. ` +
+                    `Expected ${sourcePrUrl}, got ${linkedPr}`
+                  );
+                }
+              }
+
+              // Verify QA even during repeated processing.
+              if (requireQA) {
+                const qa =
+                  properties["QA Approved"]?.checkbox;
+
+                const ac =
+                  properties["AC Approved"]?.checkbox;
+
+                if (qa !== true || ac !== true) {
+                  throw new Error(
+                    `${ticketId}: QA/AC approval missing`
+                  );
+                }
+              }
+
+              // Idempotency
+              if (currentStatus === targetStatus) {
+                core.info(
+                  `${ticketId}: Already ${targetStatus}`
+                );
+
+                return;
+              }
+
+              if (!allowedStatuses.includes(currentStatus)) {
+                throw new Error(
+                  `${ticketId}: Invalid transition ` +
+                  `${currentStatus} → ${targetStatus}`
+                );
+              }
+
+              await notionRequest(
+                `https://api.notion.com/v1/pages/${ticket.id}`,
+                {
+                  method: "PATCH",
+                  body: JSON.stringify({
+                    properties: {
+                      Status: {
+                        status: {
+                          name: targetStatus,
+                        },
+                      },
+                    },
+                  }),
+                }
+              );
+
+              core.info(
+                `${ticketId}: ${currentStatus} → ${targetStatus}`
+              );
+            };
+
+            // ------------------------------------
+            // 4. Feature → develop
+            // ------------------------------------
+
+            if (pr.base.ref === "develop") {
+              const ticketId = getTicketId(pr.head.ref);
+
+              await updateTicket({
+                ticketId,
+                targetStatus: "In QA",
+                allowedStatuses: [
+                  "In Review",
+                  "In progress",
+                  "In Progress",
+                ],
+                sourcePrUrl: pr.html_url,
+              });
+
+              core.info(
+                "Feature merged into develop. Status: In QA"
+              );
+
               return;
             }
 
-            core.info(`Ticket ${ticketId} updated successfully`);
-            core.info("Status: In QA");
-            core.info("Feature PR merged into develop");
+            // ------------------------------------
+            // 5. Ignore unsupported targets
+            // ------------------------------------
+
+            if (pr.base.ref !== "main") {
+              core.info(
+                `Unsupported target: ${pr.base.ref}`
+              );
+
+              return;
+            }
+
+            // ------------------------------------
+            // 6. Hotfix → main
+            // ------------------------------------
+
+            if (/^hotfix\//i.test(pr.head.ref)) {
+              const ticketId = getTicketId(pr.head.ref);
+
+              await updateTicket({
+                ticketId,
+                targetStatus: "Done",
+                allowedStatuses: [
+                  "Backlog",
+                  "In progress",
+                  "In Progress",
+                  "In Review",
+                  "In QA",
+                  "Ready For Merge",
+                ],
+                sourcePrUrl: pr.html_url,
+                requireQA: false,
+              });
+
+              core.info(
+                `Hotfix ${ticketId} completed`
+              );
+
+              return;
+            }
+
+            // ------------------------------------
+            // 7. Only develop can release to main
+            // ------------------------------------
+
+            if (pr.head.ref !== "develop") {
+              throw new Error(
+                `Direct merge into main is not allowed: ${pr.head.ref}`
+              );
+            }
+
+            core.info(
+              `Processing release PR: ${pr.html_url}`
+            );
+
+            // ------------------------------------
+            // 8. Find commits included in release
+            // ------------------------------------
+
+            const commits = await github.paginate(
+              github.rest.pulls.listCommits,
+              {
+                owner,
+                repo,
+                pull_number: pr.number,
+                per_page: 100,
+              }
+            );
+
+            if (commits.length === 0) {
+              throw new Error(
+                "Release has no commits"
+              );
+            }
+
+            const sourcePRs = new Map();
+
+            for (const commit of commits) {
+              const associatedPRs = await github.paginate(
+                github.rest.repos.listPullRequestsAssociatedWithCommit,
+                {
+                  owner,
+                  repo,
+                  commit_sha: commit.sha,
+                  per_page: 100,
+                }
+              );
+
+              for (const sourcePR of associatedPRs) {
+                if (
+                  sourcePR.merged_at &&
+                  sourcePR.base.ref === "develop" &&
+                  sourcePR.merge_commit_sha === commit.sha
+                ) {
+                  sourcePRs.set(
+                    sourcePR.number,
+                    sourcePR
+                  );
+                }
+              }
+            }
+
+            if (sourcePRs.size === 0) {
+              throw new Error(
+                "No source PRs identified in release. " +
+                "Cannot safely synchronize Notion tickets."
+              );
+            }
+
+            core.info(
+              `Found ${sourcePRs.size} source PRs`
+            );
+
+            // ------------------------------------
+            // 9. Validate release tickets
+            // ------------------------------------
+
+            const releaseTickets = new Map();
+
+            for (const sourcePR of sourcePRs.values()) {
+              const ticketId = getTicketId(
+                sourcePR.head.ref
+              );
+
+              if (releaseTickets.has(ticketId)) {
+                continue;
+              }
+
+              const ticket = await findTicket(ticketId);
+              const properties = ticket.properties;
+
+              const status =
+                properties.Status.status?.name;
+
+              const qa =
+                properties["QA Approved"]?.checkbox;
+
+              const ac =
+                properties["AC Approved"]?.checkbox;
+
+              const linkedPr =
+                properties["PR URL"]?.url;
+
+              core.info("------------------------------------");
+              core.info(`Release ticket: ${ticketId}`);
+              core.info(`Status: ${status}`);
+              core.info(`QA Approved: ${qa}`);
+              core.info(`AC Approved: ${ac}`);
+
+              if (
+                status !== "Ready For Merge" &&
+                status !== "Done"
+              ) {
+                throw new Error(
+                  `${ticketId}: Not ready for release`
+                );
+              }
+
+              if (qa !== true || ac !== true) {
+                throw new Error(
+                  `${ticketId}: Missing QA/AC approval`
+                );
+              }
+
+              if (linkedPr !== sourcePR.html_url) {
+                throw new Error(
+                  `${ticketId}: Source PR mismatch`
+                );
+              }
+
+              releaseTickets.set(
+                ticketId,
+                sourcePR.html_url
+              );
+            }
+
+            // ------------------------------------
+            // 10. Mark release tickets as Done
+            // ------------------------------------
+
+            let updated = 0;
+            let failures = 0;
+
+            for (const [ticketId, sourcePrUrl] of releaseTickets) {
+              try {
+                await updateTicket({
+                  ticketId,
+                  targetStatus: "Done",
+                  allowedStatuses: [
+                    "Ready For Merge",
+                  ],
+                  sourcePrUrl,
+                  requireQA: true,
+                });
+
+                updated++;
+              } catch (error) {
+                failures++;
+
+                core.error(
+                  `${ticketId}: ${error.message}`
+                );
+              }
+            }
+
+            // ------------------------------------
+            // 11. Summary
+            // ------------------------------------
+
+            core.info("------------------------------------");
+            core.info(`Release PR: ${pr.html_url}`);
+            core.info(`Source PRs: ${sourcePRs.size}`);
+            core.info(`Release tickets: ${releaseTickets.size}`);
+            core.info(`Processed: ${updated}`);
+            core.info(`Failures: ${failures}`);
+
+            if (failures > 0) {
+              core.setFailed(
+                `${failures} tickets failed to synchronize`
+              );
+
+              return;
+            }
+
+            core.info(
+              "Release → Notion synchronization completed"
+            );
