@@ -108,22 +108,6 @@ develop → Release Validation → main → Notion: Done
 
 ---
 
-## Acceptance Criteria
-
-- [ ] Branch creation works directly from Notion.
-- [ ] Branches are created from `develop`.
-- [ ] Duplicate branches are not created.
-- [ ] GitHub PRs are automatically linked to Notion tickets.
-- [ ] Notion task statuses update automatically.
-- [ ] CI results synchronize correctly.
-- [ ] Merge into `develop` triggers `In QA`.
-- [ ] QA approval is required before production release.
-- [ ] Failed QA blocks the production merge.
-- [ ] Merge into `main` triggers `Done`.
-- [ ] Repeated events do not produce duplicate or incorrect updates.
-
----
-
 ## Definition of Done
 
 The automation is considered complete when the entire workflow can be executed without manually updating technical task statuses or copying GitHub links.
@@ -136,13 +120,3 @@ The automation is considered complete when the entire workflow can be executed w
 4. **In QA** — Pull Request merged into `develop`.
 5. **Ready For Merge** — QA approved all requirements.
 6. **Done** — Release merged into `main`.
-
-### Final Goal
-
-Build a reusable, secure, and scalable automation system that can be applied to multiple repositories:
-
-- `notion-demo-front` — React
-- `notion-demo-back` — NestJS
-- `notion-demo-mobile` — React Native
-
-**No third-party automation platforms required.**
