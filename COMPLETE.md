@@ -136,13 +136,3 @@ The automation is considered complete when the entire workflow can be executed w
 4. **In QA** — Pull Request merged into `develop`.
 5. **Ready For Merge** — QA approved all requirements.
 6. **Done** — Release merged into `main`.
-
-### Final Goal
-
-Build a reusable, secure, and scalable automation system that can be applied to multiple repositories:
-
-- `notion-demo-front` — React
-- `notion-demo-back` — NestJS
-- `notion-demo-mobile` — React Native
-
-**No third-party automation platforms required.**
