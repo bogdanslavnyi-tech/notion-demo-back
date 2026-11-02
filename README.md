@@ -15,4 +15,5 @@ npm run build
 Testing automatic Notion ticket validation.
 Add new testing command!
 
-DEMO 16 is!
+DEMO 20 is!
+Its cool solution!
