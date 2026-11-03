@@ -1,0 +1,35 @@
+name: Test Microsoft Teams Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-teams:
+    name: Send Test Notification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send test message to Teams
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+
+        run: |
+          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            echo "::error::TEAMS_WEBHOOK_URL is not configured"
+            exit 1
+          fi
+
+          curl --fail-with-body \
+            --silent \
+            --show-error \
+            --max-time 30 \
+            --retry 2 \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data '{
+              "text": "GitHub Actions webhook integration test"
+            }' \
+            "$TEAMS_WEBHOOK_URL"
