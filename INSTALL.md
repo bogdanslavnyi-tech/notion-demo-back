@@ -57,5 +57,3 @@ The release algorithm is intentionally the one from your supplied `main.yml`.
 It identifies source PRs by associations between release commits and their
 merge-commit SHAs. Squash/rebase or other release strategies can break this
 association; test those before using this as a production release gate.
-
-## P.S. Bogdan is a best dev!
