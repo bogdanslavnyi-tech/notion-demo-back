@@ -40,7 +40,7 @@ jobs:
 
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const sendTeams = require('./.github/scripts/send-teams.js');
+            const sendTeams = require('./.github/scripts/send-teams.cjs');
 
             if (!token || !dataSourceId) {
               core.setFailed("Notion configuration is missing");
