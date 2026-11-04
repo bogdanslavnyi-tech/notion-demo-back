@@ -36,7 +36,7 @@ jobs:
 
         with:
           script: |
-            const sendTeams = require('./.github/scripts/send-teams.js');
+            const sendTeams = require('./.github/scripts/send-teams.cjs');
 
             const status = process.env.TEST_STATUS;
             const ticketId = 'DEMO-19';
