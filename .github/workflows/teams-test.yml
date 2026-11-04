@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       status:
-        description: 'Visual status to preview in Teams'
+        description: "Visual status to preview in Teams"
         required: true
         type: choice
         options:
@@ -20,22 +20,27 @@ jobs:
   test-teams:
     name: Send Test Notification
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout trusted helper
         uses: actions/checkout@v4
         with:
           ref: main
           persist-credentials: false
+
       - name: Preview status card
         uses: actions/github-script@v7
         env:
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
           TEST_STATUS: ${{ inputs.status }}
+
         with:
           script: |
             const sendTeams = require('./.github/scripts/send-teams.js');
+
             const status = process.env.TEST_STATUS;
             const ticketId = 'DEMO-19';
+
             await sendTeams({
               webhookUrl: process.env.TEAMS_WEBHOOK_URL,
               core,
@@ -44,8 +49,17 @@ jobs:
               repository: 'Backend',
               ticket: {
                 url: 'https://www.notion.so/',
-                properties: { Name: { type: 'title', title: [{ plain_text: 'Teams status card preview' }] } },
+                properties: {
+                  Name: {
+                    type: 'title',
+                    title: [
+                      {
+                        plain_text: 'Teams status card preview'
+                      }
+                    ]
+                  }
+                }
               },
               prUrl: `https://github.com/${context.repo.owner}/${context.repo.repo}/pulls`,
-              event: 'Manual visual test only — no Notion task was changed.',
+              event: 'Manual visual test only — no Notion task was changed.'
             });
