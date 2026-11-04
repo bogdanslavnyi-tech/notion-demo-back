@@ -33,7 +33,7 @@ jobs:
           script: |
             const token = process.env.NOTION_TOKEN;
             const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
-            const sendTeams = require('./.github/scripts/send-teams.js');
+            const sendTeams = require('./.github/scripts/send-teams.cjs');
             if (!token || !dataSourceId) {
               core.setFailed('Notion configuration missing');
               return;
