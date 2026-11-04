@@ -3,7 +3,7 @@ name: Sync QA Approval to Notion
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
@@ -16,212 +16,89 @@ jobs:
   sync-qa:
     name: Update Notion QA Status
     runs-on: ubuntu-latest
-
     steps:
+      - name: Checkout trusted notification helper
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
       - name: Sync QA approvals
         uses: actions/github-script@v7
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATA_SOURCE_ID: ${{ vars.NOTION_DATA_SOURCE_ID }}
-
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
         with:
           script: |
-            // ------------------------------------
-            // 1. Configuration
-            // ------------------------------------
-
             const token = process.env.NOTION_TOKEN;
             const dataSourceId = process.env.NOTION_DATA_SOURCE_ID;
-
+            const sendTeams = require('./.github/scripts/send-teams.js');
             if (!token || !dataSourceId) {
-              core.setFailed("Notion configuration is missing");
+              core.setFailed('Notion configuration missing');
               return;
             }
-
             const headers = {
               Authorization: `Bearer ${token}`,
-              "Notion-Version": "2026-03-11",
-              "Content-Type": "application/json",
+              'Notion-Version': '2026-03-11',
+              'Content-Type': 'application/json',
             };
-
             const notionRequest = async (url, options = {}) => {
-              const response = await fetch(url, {
-                ...options,
-                headers,
-              });
-
-              if (!response.ok) {
-                const error = await response.text();
-
-                throw new Error(
-                  `Notion API HTTP ${response.status}: ${error}`
-                );
-              }
-
+              const response = await fetch(url, { ...options, headers });
+              if (!response.ok) throw new Error(`Notion HTTP ${response.status}: ${await response.text()}`);
               return response.json();
             };
-
-            // ------------------------------------
-            // 2. Find tasks currently in QA
-            // ------------------------------------
-
             const tasks = [];
             let cursor;
-
             do {
-              const body = {
-                page_size: 100,
-                filter: {
-                  property: "Status",
-                  status: {
-                    equals: "In QA",
-                  },
-                },
-              };
-
-              if (cursor) {
-                body.start_cursor = cursor;
-              }
-
+              const body = { page_size: 100,
+                filter: { property: 'Status', status: { equals: 'In QA' } } };
+              if (cursor) body.start_cursor = cursor;
               const result = await notionRequest(
                 `https://api.notion.com/v1/data_sources/${dataSourceId}/query`,
-                {
-                  method: "POST",
-                  body: JSON.stringify(body),
-                }
+                { method: 'POST', body: JSON.stringify(body) }
               );
-
               tasks.push(...result.results);
-
-              cursor = result.has_more
-                ? result.next_cursor
-                : undefined;
+              cursor = result.has_more ? result.next_cursor : undefined;
             } while (cursor);
-
-            core.info(`Found ${tasks.length} tasks in QA`);
-
-            // ------------------------------------
-            // 3. Process QA approvals
-            // ------------------------------------
 
             let updated = 0;
             let skipped = 0;
             let failures = 0;
-
             for (const task of tasks) {
               try {
-                const properties = task.properties;
-
-                const repository =
-                  properties.Repository?.select?.name;
-
-                // This workflow belongs to Backend.
-                if (repository !== "Backend") {
+                const props = task.properties;
+                if (props.Repository?.select?.name !== 'Backend') {
                   skipped++;
                   continue;
                 }
-
-                const taskId =
-                  properties["Task ID"]?.unique_id;
-
-                if (
-                  taskId?.number == null ||
-                  !taskId?.prefix
-                ) {
-                  throw new Error("Task ID is missing");
+                const id = props['Task ID']?.unique_id;
+                if (id?.number == null || !id.prefix) throw new Error('Task ID is missing');
+                const ticketId = `${id.prefix}-${id.number}`;
+                if (props.Status?.type !== 'status' ||
+                    props['QA Approved']?.type !== 'checkbox' ||
+                    props['AC Approved']?.type !== 'checkbox') {
+                  throw new Error(`${ticketId}: Invalid Notion property types`);
                 }
-
-                const ticketId =
-                  `${taskId.prefix}-${taskId.number}`;
-
-                // ------------------------------------
-                // 4. Validate property types
-                // ------------------------------------
-
-                if (
-                  properties.Status?.type !== "status" ||
-                  properties["QA Approved"]?.type !== "checkbox" ||
-                  properties["AC Approved"]?.type !== "checkbox"
-                ) {
-                  throw new Error(
-                    `${ticketId}: Invalid Notion property types`
-                  );
-                }
-
-                const status =
-                  properties.Status.status?.name;
-
-                const qaApproved =
-                  properties["QA Approved"].checkbox;
-
-                const acApproved =
-                  properties["AC Approved"].checkbox;
-
-                core.info(`------------------------------------`);
-                core.info(`Ticket: ${ticketId}`);
-                core.info(`Status: ${status}`);
-                core.info(`QA Approved: ${qaApproved}`);
-                core.info(`AC Approved: ${acApproved}`);
-
-                // ------------------------------------
-                // 5. Check approval requirements
-                // ------------------------------------
-
-                if (!qaApproved || !acApproved) {
-                  core.info(
-                    `${ticketId}: Waiting for QA/AC approval`
-                  );
-
+                if (props['QA Approved'].checkbox !== true || props['AC Approved'].checkbox !== true) {
                   skipped++;
                   continue;
                 }
-
-                // ------------------------------------
-                // 6. Update Notion status
-                // ------------------------------------
-
-                await notionRequest(
-                  `https://api.notion.com/v1/pages/${task.id}`,
-                  {
-                    method: "PATCH",
-                    body: JSON.stringify({
-                      properties: {
-                        Status: {
-                          status: {
-                            name: "Ready For Merge",
-                          },
-                        },
-                      },
-                    }),
-                  }
-                );
-
+                await notionRequest(`https://api.notion.com/v1/pages/${task.id}`, {
+                  method: 'PATCH', body: JSON.stringify({
+                    properties: { Status: { status: { name: 'Ready For Merge' } } },
+                  }),
+                });
                 updated++;
-
-                core.info(
-                  `${ticketId}: In QA → Ready For Merge`
-                );
+                core.info(`${ticketId}: In QA → Ready For Merge`);
+                await sendTeams({ webhookUrl: process.env.TEAMS_WEBHOOK_URL, core,
+                  ticket: task, ticketId, status: 'Ready For Merge', repository: 'Backend',
+                  prUrl: props['PR URL']?.url,
+                  event: 'QA and acceptance criteria approved — ready for release.' });
               } catch (error) {
                 failures++;
-
-                core.error(
-                  `Task ${task.id}: ${error.message}`
-                );
+                core.error(`Task ${task.id}: ${error.message}`);
               }
             }
-
-            // ------------------------------------
-            // 7. Summary
-            // ------------------------------------
-
-            core.info("------------------------------------");
-            core.info("QA synchronization completed");
-            core.info(`Updated: ${updated}`);
-            core.info(`Skipped: ${skipped}`);
-            core.info(`Failed: ${failures}`);
-
-            if (failures > 0) {
-              core.setFailed(
-                `${failures} tasks failed to synchronize`
-              );
-            }
+            core.info(`QA synchronization: updated=${updated}, skipped=${skipped}, failed=${failures}`);
+            if (failures > 0) core.setFailed(`${failures} tasks failed to synchronize`);
